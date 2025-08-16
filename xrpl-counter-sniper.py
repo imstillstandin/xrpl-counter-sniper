@@ -17,12 +17,23 @@ from decimal import Decimal, getcontext
 from typing import Dict, List, Optional, Tuple
 
 from xrpl.asyncio.clients import AsyncWebsocketClient
-from xrpl.asyncio.transaction import safe_sign_and_autofill_transaction, send_reliable_submission
+# xrpl-py v4 API; we add shims below so old helper names still work.
+from xrpl.asyncio.transaction import autofill, sign, submit_and_wait
 from xrpl.wallet import Wallet
 from xrpl.models.transactions import TicketCreate, OfferCreate
 from xrpl.models.requests import Subscribe, BookOffers, AccountObjects
 
 getcontext().prec = 28
+
+# --- Compatibility shims for v4 so existing calls work unchanged ---
+async def safe_sign_and_autofill_transaction(tx, client, wallet):
+    filled = await autofill(tx, client)
+    signed = sign(filled, wallet)  # sign() is sync in v4
+    return signed
+
+async def send_reliable_submission(signed, client):
+    return await submit_and_wait(signed, client)
+# -------------------------------------------------------------------
 
 RIPPLED_URL = os.getenv("XRPL_WS", "wss://xrplcluster.com")
 NETWORK_TIMEOUT_S = 20
@@ -39,7 +50,6 @@ FALLBACK_SELL_AFTER_S = 120
 SELL_SIZE_FRACTION = Decimal("0.8")
 
 HOT_WALLET_SEED_ENV = "XRPL_SEED"
-
 TELEGRAM_WEBHOOK = os.getenv("TELEGRAM_WEBHOOK", "")
 
 LOG_DIR = os.getenv("LOG_DIR", "./logs")
@@ -49,9 +59,9 @@ TRADE_LOG_CSV = os.path.join(LOG_DIR, "trades.csv")
 PNL_LOG_CSV = os.path.join(LOG_DIR, "pnl.csv")
 
 PNL_MTM_INTERVAL_S = 30
-
 os.makedirs(LOG_DIR, exist_ok=True)
 
+# ---------------------- MODELS ----------------------
 @dataclass
 class Pool:
     amm_create_tx: dict
@@ -95,10 +105,9 @@ class Position:
         if self.qty_iou == 0:
             self.avg_cost_xrp_per_iou = Decimal(0)
 
-
+# ---------------------- UTIL ----------------------
 def ts() -> str:
     return datetime.now(timezone.utc).isoformat()
-
 
 def write_csv(path: str, row: List):
     exists = os.path.exists(path)
@@ -108,12 +117,21 @@ def write_csv(path: str, row: List):
             w.writerow(["ts", *[f"col{i}" for i in range(len(row))]])
         w.writerow([ts(), *row])
 
-def write_pnl(symbol: str, pos: Position, mtm_px: Optional[Decimal]=None):
+def write_pnl(symbol: str, pos: Position, mtm_px: Optional[Decimal] = None):
     unreal = None
     if mtm_px is not None and pos.qty_iou > 0:
         unreal = pos.qty_iou * (mtm_px - pos.avg_cost_xrp_per_iou)
-    write_csv(PNL_LOG_CSV, [symbol, str(pos.qty_iou), str(pos.avg_cost_xrp_per_iou),
-                            str(mtm_px) if mtm_px else "", str(unreal) if unreal else "", str(pos.realized_pnl_xrp)])
+    write_csv(
+        PNL_LOG_CSV,
+        [
+            symbol,
+            str(pos.qty_iou),
+            str(pos.avg_cost_xrp_per_iou),
+            "" if mtm_px is None else str(mtm_px),
+            "" if unreal is None else str(unreal),
+            str(pos.realized_pnl_xrp),
+        ],
+    )
 
 async def alert(msg: str):
     if not TELEGRAM_WEBHOOK:
@@ -128,10 +146,9 @@ async def alert(msg: str):
     except Exception:
         pass
 
-
+# ---------------------- HELPERS ----------------------
 def is_amm_create(tx: dict) -> bool:
     return tx.get("TransactionType") == "AMMCreate" and tx.get("validated", False)
-
 
 def pool_assets_from_amm_create(tx: dict) -> Optional[Tuple[dict, dict]]:
     a1 = tx.get("Asset") or {}
@@ -140,10 +157,8 @@ def pool_assets_from_amm_create(tx: dict) -> Optional[Tuple[dict, dict]]:
         return a1, a2
     return None
 
-
 def is_xrp_asset(asset: dict) -> bool:
     return (isinstance(asset, dict) and asset.get("currency") == "XRP") or asset == "XRP"
-
 
 def pool_key(a1: dict, a2: dict) -> str:
     def norm(a: dict) -> str:
@@ -154,7 +169,6 @@ def pool_key(a1: dict, a2: dict) -> str:
         return f"{ccy}.{iss}"
     return "|".join(sorted([norm(a1), norm(a2)]))
 
-
 def tx_is_tradey(tx: dict) -> bool:
     t = tx.get("TransactionType")
     if t in ("OfferCreate", "AMMBid", "Payment"):
@@ -162,7 +176,6 @@ def tx_is_tradey(tx: dict) -> bool:
     if t in ("AMMDeposit",):
         return True
     return False
-
 
 async def best_price_xrp_per_iou(client: AsyncWebsocketClient, iou: dict) -> Optional[Decimal]:
     req = BookOffers(
@@ -174,13 +187,11 @@ async def best_price_xrp_per_iou(client: AsyncWebsocketClient, iou: dict) -> Opt
     offers = (resp.result or {}).get("offers", [])
     if not offers:
         return None
-    q = Decimal(offers[0]["quality"])
+    q = Decimal(offers[0]["quality"])  # drops per IOU unit
     return q / Decimal(1_000_000)
-
 
 def xrp_drops_to_xrp(drops: int) -> Decimal:
     return Decimal(drops) / Decimal(1_000_000)
-
 
 async def get_one_ticket_sequence(client: AsyncWebsocketClient, address: str) -> Optional[int]:
     resp = await client.request(AccountObjects(account=address, type="ticket", limit=5))
@@ -189,7 +200,7 @@ async def get_one_ticket_sequence(client: AsyncWebsocketClient, address: str) ->
             return int(obj.get("TicketSequence"))
     return None
 
-
+# ---------------------- CORE ----------------------
 class CounterSniper:
     def __init__(self, url: str):
         self.url = url
@@ -204,16 +215,18 @@ class CounterSniper:
         return f"{iou['currency']}.{iou['issuer']}"
 
     async def connect(self):
-        self.client = AsyncWebsocketClient(self.url, timeout=NETWORK_TIMEOUT_S)
-        await self.client.open()
+        # v4 constructor doesn't accept timeout=; wrap calls with wait_for
+        self.client = AsyncWebsocketClient(self.url)
+        await asyncio.wait_for(self.client.open(), timeout=NETWORK_TIMEOUT_S)
         sub = Subscribe(streams=["transactions", "ledger"])
-        await self.client.request(sub)
+        await asyncio.wait_for(self.client.request(sub), timeout=NETWORK_TIMEOUT_S)
         print(f"[{ts()}] Connected & subscribed")
 
     async def run(self):
         if not self.client:
             await self.connect()
         assert self.client is not None
+
         async for msg in self.client:
             if not isinstance(msg, dict):
                 continue
@@ -229,6 +242,7 @@ class CounterSniper:
             if not validated:
                 continue
 
+            # 1) Detect new pools
             if is_amm_create({**tx, "validated": validated}):
                 assets = pool_assets_from_amm_create(tx)
                 if not assets:
@@ -247,6 +261,7 @@ class CounterSniper:
                 await alert(f"New pool detected: {key}")
                 continue
 
+            # 2) Early actor scoring
             if not self.tracked_pools:
                 continue
             account = tx.get("Account")
@@ -269,7 +284,10 @@ class CounterSniper:
                 earliness = max(LAUNCH_WINDOW_LEDGER_COUNT - (ledger_index - pool.created_ledger), 1)
                 burst.score += 1.0 + (earliness / LAUNCH_WINDOW_LEDGER_COUNT)
 
-                write_csv(SNIPER_LOG_CSV, [account, key, ledger_index, tx.get("TransactionType"), burst.tx_count_early, round(burst.score, 3)])
+                write_csv(
+                    SNIPER_LOG_CSV,
+                    [account, key, ledger_index, tx.get("TransactionType"), burst.tx_count_early, round(burst.score, 3)],
+                )
 
                 if self._looks_like_sniper(burst):
                     await alert(f"Sniper {account[:6]}… detected on {key}")
@@ -314,7 +332,17 @@ class CounterSniper:
             if not seed:
                 return
             self.wallet = Wallet.from_seed(seed)
-        # Live trading logic placeholder
+
+        # Live trading example (still basic; PnL assumes submitted prices)
+        buy_offer = OfferCreate(
+            account=self.wallet.classic_address,
+            taker_gets=str(MICRO_BUY_XRP_DROPS),  # pay XRP drops
+            taker_pays={"currency": iou["currency"], "issuer": iou["issuer"], "value": f"{iou_to_receive:.12f}"},
+            flags=0,
+        )
+        signed_buy = await safe_sign_and_autofill_transaction(buy_offer, self.client, self.wallet)
+        await send_reliable_submission(signed_buy, self.client)
+
         pos = self.positions.get(symbol) or Position(symbol)
         pos.on_buy(iou_to_receive, max_price)
         self.positions[symbol] = pos
@@ -326,10 +354,10 @@ class CounterSniper:
                     if pos.qty_iou <= 0:
                         write_pnl(symbol, pos)
                         continue
-                    ccy, issuer = symbol.split(".",1)
+                    ccy, issuer = symbol.split(".", 1)
                     iou = {"currency": ccy, "issuer": issuer}
                     px = await best_price_xrp_per_iou(self.client, iou)
-                    if px:
+                    if px is not None:
                         write_pnl(symbol, pos, px)
                     else:
                         write_pnl(symbol, pos)
@@ -337,7 +365,7 @@ class CounterSniper:
                 write_csv(PNL_LOG_CSV, ["ERROR", str(e)])
             await asyncio.sleep(PNL_MTM_INTERVAL_S)
 
-
+# ---------------------- RUN ----------------------
 async def main():
     bot = CounterSniper(RIPPLED_URL)
     await bot.connect()
@@ -348,12 +376,8 @@ async def main():
         if bot.client:
             await bot.client.close()
 
-
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nShutting down…")
-
-
-
