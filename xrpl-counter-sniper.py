@@ -25,6 +25,7 @@ from xrpl.models.requests import Subscribe, BookOffers, AccountObjects
 
 getcontext().prec = 28
 
+print("[DEBUG] Bot has started. Waiting for sniper activity...")
 # --- Compatibility shims for v4 so existing calls work unchanged ---
 async def safe_sign_and_autofill_transaction(tx, client, wallet):
     filled = await autofill(tx, client)
@@ -210,6 +211,13 @@ class CounterSniper:
         self.current_ledger_index: int = 0
         self.wallet: Optional[Wallet] = None
         self.positions: Dict[str, Position] = {}
+
+        self.snipes_handled = 0 
+
+        # Print to confirm bot actually initialized
+        print("[DEBUG] CounterSniper initialized. Watching for sniper events...")
+
+        
 
     def _symbol_from_iou(self, iou: dict) -> str:
         return f"{iou['currency']}.{iou['issuer']}"
