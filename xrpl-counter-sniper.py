@@ -49,7 +49,9 @@ SELL_SIZE_FRACTION = Decimal("0.8")
 HOT_WALLET_SEED_ENV = "XRPL_SEED"
 
 # Logging
-LOG_DIR = os.getenv("LOG_DIR", "./logs")
+# Replace your current LOG_DIR line with these two lines:
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.getenv("LOG_DIR", os.path.join(BASE_DIR, "logs"))
 SNIPER_LOG_CSV = os.path.join(LOG_DIR, "sniper_activity.csv")
 POOL_LOG_CSV = os.path.join(LOG_DIR, "pools.csv")
 TRADE_LOG_CSV = os.path.join(LOG_DIR, "trades.csv")
